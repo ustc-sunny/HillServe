@@ -1,0 +1,78 @@
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -1145,6 +1145,41 @@
+          ggml_tensor * kq_mask,
+          ggml_tensor * v_mla,
+              float     kq_scale) const {
++    // External KV is updated by the hs_append callback. Keep its attention
++    // consumers on the actual KV device: a CPU split could otherwise copy
++    // shared K/V/mask inputs before that callback has installed this layer.
++    // offload_kqv permits offload, but does not itself pin every MHA operation.
++    ggml_backend_t hs_attention_backend = nullptr;
++    const auto hs_attention = llama_hillserve_configuration();
++    if (hs_attention.enabled && hs_attention.external && hs_attention.per_query_head && cparams.offload_kqv) {
++        if (cparams.flash_attn || !hs_attention.k || !hs_attention.k->buffer ||
++                ggml_backend_buffer_is_host(hs_attention.k->buffer)) {
++            throw std::runtime_error("HillServe: external MHA requires non-host GPU KV and non-flash attention");
++        }
++        auto * kv_device = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(hs_attention.k->buffer));
++        if (!kv_device || ggml_backend_dev_type(kv_device) != GGML_BACKEND_DEVICE_TYPE_GPU) {
++            throw std::runtime_error("HillServe: external KV is not on a GPU device");
++        }
++        for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
++            auto * candidate = ggml_backend_sched_get_backend(sched, i);
++            if (ggml_backend_get_device(candidate) == kv_device) {
++                hs_attention_backend = candidate;
++                break;
++            }
++        }
++        if (!hs_attention_backend) {
++            throw std::runtime_error("HillServe: external KV GPU has no matching scheduler backend");
++        }
++    }
++    const auto pin_hs_attention = [&](ggml_tensor * tensor) {
++        if (hs_attention_backend) {
++            if (!ggml_backend_supports_op(hs_attention_backend, tensor)) {
++                throw std::runtime_error("HillServe: external MHA operation unsupported by KV GPU");
++            }
++            ggml_backend_sched_set_tensor_backend(sched, tensor, hs_attention_backend);
++        }
++    };
++
+     const bool v_trans = v->nb[1] > v->nb[2];
+ 
+     // split the batch into streams if needed
+@@ -1201,6 +1236,7 @@
+         cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
+     } else {
+         ggml_tensor * kq = ggml_mul_mat(ctx0, k, q);
++        pin_hs_attention(kq);
+ 
+         // note: this op tends to require high floating point range
+         //       while for some models F16 is enough, for others it is not, so we default to F32 here
+@@ -1228,13 +1264,16 @@
+         }
+ 
+         kq = ggml_soft_max_ext(ctx0, kq, kq_mask, kq_scale, hparams.f_max_alibi_bias);
++        pin_hs_attention(kq);
+ 
+         if (!v_trans) {
+             // note: avoid this branch
+             v = ggml_cont(ctx0, ggml_transpose(ctx0, v));
++            pin_hs_attention(v);
+         }
+ 
+         ggml_tensor * kqv = ggml_mul_mat(ctx0, v, kq);
++        pin_hs_attention(kqv);
+         const auto value_control = llama_hillserve_configuration();
+         if (value_control.enabled && value_control.f32_value_control) {
+             ggml_mul_mat_set_prec(kqv, GGML_PREC_F32);
+@@ -1249,6 +1288,7 @@
+ 
+         // recombine streams
+         cur = ggml_cont_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
++        pin_hs_attention(cur);
+ 
+         if (!cparams.offload_kqv) {
+             // all nodes between the KV store and the attention output are run on the CPU

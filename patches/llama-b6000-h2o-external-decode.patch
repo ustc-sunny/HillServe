@@ -1,0 +1,16 @@
+--- a/src/llama-kv-cache-unified.cpp
++++ b/src/llama-kv-cache-unified.cpp
+@@ -544,7 +544,12 @@
+             const auto hs = llama_hillserve_configuration();
+             const auto & cells = v_cells[0];
+             const auto next = cells.get_used();
+-            if (!hs.enabled || !hs.external || hs.native_prefill || !hs.per_query_head ||
++            // Releasing native payload does not require expanded per-Q-head
++            // KV. Physical GQA heads are also legal for complete-history
++            // attention; they must not carry a sparse slot limit.
++            const bool valid_external_layout = hs.per_query_head || hs.sparse_slots == 0;
++            if (!hs.enabled || !hs.external || hs.native_prefill || !valid_external_layout ||
++                !hs.k || !hs.v || !hs.mask ||
+                 ubatches.size() != 1 || ubatches[0].n_tokens != 1 || next >= hs.slots ||
+                 cells.used_max_p1() != next || ubatches[0].pos[0] != llama_pos(next) ||
+                 ubatches[0].n_seq_id[0] != 1 || ubatches[0].seq_id[0][0] != 0) {

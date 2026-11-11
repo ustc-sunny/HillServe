@@ -1,0 +1,378 @@
+diff --git a/ggml/include/ggml-backend.h b/ggml/include/ggml-backend.h
+index a2977ea..83d6d85 100644
+--- a/ggml/include/ggml-backend.h
++++ b/ggml/include/ggml-backend.h
+@@ -287,6 +287,9 @@ extern "C" {
+     // if the user returns false, the scheduler will cancel the graph compute
+     //
+     typedef bool (*ggml_backend_sched_eval_callback)(struct ggml_tensor * t, bool ask, void * user_data);
++    // HillServe: phase 0 before enqueue, 1 after enqueue, 2 after existing synchronization.
++    typedef void (*ggml_backend_sched_profile_callback)(ggml_backend_t backend, struct ggml_tensor * last, int phase, int nodes, void * user_data);
++    GGML_API void ggml_backend_sched_set_profile_callback(ggml_backend_sched_t sched, ggml_backend_sched_profile_callback callback, void * user_data);
+ 
+     // Initialize a backend scheduler, backends with low index are given priority over backends with high index
+     GGML_API ggml_backend_sched_t ggml_backend_sched_new(ggml_backend_t * backends, ggml_backend_buffer_type_t * bufts, int n_backends, size_t graph_size, bool parallel, bool op_offload);
+diff --git a/ggml/include/ggml-cuda.h b/ggml/include/ggml-cuda.h
+index 22ad2c0..aedd88d 100644
+--- a/ggml/include/ggml-cuda.h
++++ b/ggml/include/ggml-cuda.h
+@@ -23,6 +23,8 @@ extern "C" {
+ GGML_BACKEND_API ggml_backend_t ggml_backend_cuda_init(int device);
+ 
+ GGML_BACKEND_API bool ggml_backend_is_cuda(ggml_backend_t backend);
++// Research timing only: actual backend stream, caller must not change it.
++GGML_BACKEND_API void * ggml_backend_cuda_hillserve_stream(ggml_backend_t backend);
+ 
+ // device buffer
+ GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device);
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index eaf41e5..ef8f83a 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -656,6 +656,8 @@ struct ggml_backend_sched {
+ 
+     ggml_backend_sched_eval_callback callback_eval;
+     void * callback_eval_user_data;
++    ggml_backend_sched_profile_callback callback_profile;
++    void * callback_profile_user_data;
+ 
+     char * context_buffer;
+     size_t context_buffer_size;
+@@ -1410,16 +1412,19 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+ 
+                 struct ggml_cgraph gv = ggml_graph_view(&split->graph, j0, j1 + 1);
+ 
++                if (sched->callback_profile) sched->callback_profile(split_backend, t, 0, j1-j0+1, sched->callback_profile_user_data);
+                 enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &gv);
++                if (sched->callback_profile) sched->callback_profile(split_backend, t, 1, j1-j0+1, sched->callback_profile_user_data);
+                 if (ec != GGML_STATUS_SUCCESS) {
+                     return ec;
+                 }
+ 
+                 // TODO: pass backend to the callback, then the user can decide if they want to synchronize
+                 ggml_backend_synchronize(split_backend);
++                if (sched->callback_profile) sched->callback_profile(split_backend, t, 2, j1-j0+1, sched->callback_profile_user_data);
+ 
+                 if (need && !sched->callback_eval(t, false, sched->callback_eval_user_data)) {
+-                    break;
++                    return GGML_STATUS_ABORTED;
+                 }
+ 
+                 j0 = j1;
+@@ -1602,6 +1607,11 @@ void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backe
+     sched->callback_eval_user_data = user_data;
+ }
+ 
++void ggml_backend_sched_set_profile_callback(ggml_backend_sched_t sched, ggml_backend_sched_profile_callback callback, void * user_data) {
++    sched->callback_profile = callback;
++    sched->callback_profile_user_data = user_data;
++}
++
+ int ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched) {
+     return sched->n_splits;
+ }
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 03c3808..7ef5e8d 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -3008,6 +3008,11 @@ bool ggml_backend_is_cuda(ggml_backend_t backend) {
+     return backend != NULL && ggml_guid_matches(backend->guid, ggml_backend_cuda_guid());
+ }
+ 
++void * ggml_backend_cuda_hillserve_stream(ggml_backend_t backend) {
++    GGML_ASSERT(ggml_backend_is_cuda(backend));
++    return static_cast<ggml_backend_cuda_context *>(backend->context)->stream();
++}
++
+ int ggml_backend_cuda_get_device_count() {
+     return ggml_cuda_info().device_count;
+ }
+diff --git a/include/llama.h b/include/llama.h
+index 6f454a5..bca49c7 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -292,6 +292,27 @@ extern "C" {
+ 
+     // NOTE: changing the default values of parameters marked as [EXPERIMENTAL] may cause crashes or incorrect results in certain configurations
+     //       https://github.com/ggml-org/llama.cpp/pull/7544
++
++    // HillServe research extension; caller owns tensors, one active context per thread.
++    struct llama_hillserve_config {
++        bool enabled;
++        bool external;
++        uint32_t slots;
++        uint32_t max_tokens;
++        struct ggml_tensor * k;
++        struct ggml_tensor * v;
++        struct ggml_tensor * mask;
++        bool f32_value_control; // Explicit research control, default remains unchanged.
++        bool per_query_head; // Independent logical selections sharing physical GQA KV.
++        uint32_t sparse_slots; // Decoder layers >=2; capacity bound, never implicit truncation.
++    };
++    LLAMA_API void llama_hillserve_configure(const struct llama_hillserve_config * config);
++    LLAMA_API struct llama_hillserve_config llama_hillserve_configuration(void);
++    LLAMA_API size_t llama_hillserve_native_kv_bytes(struct llama_context * ctx);
++    LLAMA_API size_t llama_hillserve_weight_bytes(struct llama_model * model, bool gpu);
++    LLAMA_API size_t llama_hillserve_graph_bytes(struct llama_context * ctx, bool gpu);
++    LLAMA_API void llama_hillserve_set_profile(struct llama_context * ctx, ggml_backend_sched_profile_callback callback, void * user_data);
++
+     struct llama_context_params {
+         uint32_t n_ctx;             // text context, 0 = from model
+         uint32_t n_batch;           // logical maximum batch size that can be submitted to llama_decode
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 84f9cca..eb5f09f 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -55,6 +55,11 @@ llama_context::llama_context(
+                                hparams.n_ctx_orig_yarn != 0 ? hparams.n_ctx_orig_yarn :
+                                                               hparams.n_ctx_train;
+ 
++    const auto hs = llama_hillserve_configuration();
++    if (hs.enabled && (!params.cb_eval || params.flash_attn || params.n_seq_max != 1 ||
++        !params.offload_kqv || (model.arch != LLM_ARCH_QWEN2 && model.arch != LLM_ARCH_LLAMA))) {
++        throw std::runtime_error("HillServe requires Qwen2 or Llama, one sequence, GPU attention and runtime callback");
++    }
+     cparams.cb_eval           = params.cb_eval;
+     cparams.cb_eval_user_data = params.cb_eval_user_data;
+ 
+@@ -716,7 +721,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
+     const auto gparams = graph_params(res, ubatch, mctx, gtype);
+ 
+-    if (res->can_reuse(gparams)) {
++    if (!llama_hillserve_configuration().enabled && res->can_reuse(gparams)) {
+         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
+ 
+         n_reused++;
+@@ -2917,3 +2922,7 @@ void llama_opt_epoch(
+         callback_train,
+         callback_eval);
+ }
++
++void llama_hillserve_set_profile(llama_context * ctx, ggml_backend_sched_profile_callback callback, void * user_data) {
++    ggml_backend_sched_set_profile_callback(ctx->get_sched(), callback, user_data);
++}
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index b63a410..3c51142 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -1,3 +1,4 @@
++#include <stdexcept>
+ #include "llama-graph.h"
+ 
+ #include "llama-impl.h"
+@@ -306,10 +307,13 @@ void llm_graph_input_attn_no_cache::set_input(const llama_ubatch * ubatch) {
+ }
+ 
+ void llm_graph_input_attn_kv_unified::set_input(const llama_ubatch * ubatch) {
+-    mctx->set_input_k_idxs(self_k_idxs, ubatch);
+-    mctx->set_input_v_idxs(self_v_idxs, ubatch);
+-
+-    mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
++    const auto hs = llama_hillserve_configuration();
++    if (!hs.enabled || !hs.external) {
++        mctx->set_input_k_idxs(self_k_idxs, ubatch);
++        mctx->set_input_v_idxs(self_v_idxs, ubatch);
++    }
++    // Hook mode supplies a live mask at the synchronized per-layer barrier.
++    if (!hs.enabled) mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
+ }
+ 
+ bool llm_graph_input_attn_kv_unified::can_reuse(const llm_graph_params & params) {
+@@ -1231,6 +1235,10 @@ ggml_tensor * llm_graph_context::build_attn_mha(
+         }
+ 
+         ggml_tensor * kqv = ggml_mul_mat(ctx0, v, kq);
++        const auto value_control = llama_hillserve_configuration();
++        if (value_control.enabled && value_control.f32_value_control) {
++            ggml_mul_mat_set_prec(kqv, GGML_PREC_F32);
++        }
+ 
+         // for MLA with the absorption optimization, we need to "decompress" from MQA back to MHA
+         if (v_mla) {
+@@ -1367,8 +1375,9 @@ ggml_tensor * llm_graph_context::build_attn(
+ 
+     const auto * mctx_cur = inp->mctx;
+ 
+-    // store to KV cache
+-    {
++    const auto hs = llama_hillserve_configuration();
++    // Native/reference mode retains native storage. External mode has no per-layer cache tensors.
++    if (!hs.enabled || !hs.external) {
+         const auto & k_idxs = inp->get_k_idxs();
+         const auto & v_idxs = inp->get_v_idxs();
+ 
+@@ -1376,12 +1385,36 @@ ggml_tensor * llm_graph_context::build_attn(
+         ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
+     }
+ 
+-    const auto & kq_mask = inp->get_kq_mask();
+-
++    ggml_tensor * kq_mask = inp->get_kq_mask();
+     ggml_tensor * q = q_cur;
+-    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+-    ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+-
++    ggml_tensor * k = nullptr;
++    ggml_tensor * v = nullptr;
++    if (hs.enabled) {
++        if ((arch != LLM_ARCH_QWEN2 && arch != LLM_ARCH_LLAMA) || ubatch.n_tokens > hs.max_tokens || !hs.mask || hs.slots == 0) {
++            throw std::runtime_error("HillServe: unsupported graph capacity or model");
++        }
++        uint32_t count = hs.external ? std::min(hs.slots, mctx_cur->get_n_kv()) : mctx_cur->get_n_kv();
++        if (hs.per_query_head && hs.sparse_slots && ubatch.n_tokens == 1 && il >= 2) count = std::min(count, hs.sparse_slots);
++        if (count > hs.slots) throw std::runtime_error("HillServe: mask capacity");
++        // This op materializes current post-RoPE K and raw V on GPU. Its completion is the I/O boundary.
++        auto * current = ggml_cast(ctx0, ggml_concat(ctx0, k_cur, v_cur, 0), GGML_TYPE_F16);
++        ggml_format_name(current, "hs_append_%d_%u", il, count);
++        ggml_build_forward_expand(gf, current);
++        if (hs.external) {
++            const auto d = hparams.n_embd_head_k;
++            const auto h = hs.per_query_head ? hparams.n_head(il) : hparams.n_head_kv(il);
++            k = ggml_view_4d(ctx0, hs.k, d,h,count,1, d*2,d*h*2,hs.slots*d*h*2,0);
++            const auto stride = hs.per_query_head ? count : hs.slots;
++            v = ggml_view_4d(ctx0, hs.v, count,h,d,1, stride*d*2,stride*2,stride*d*h*2,0);
++        }
++        kq_mask = ggml_view_4d(ctx0, hs.mask, count,GGML_PAD(ubatch.n_tokens,GGML_KQ_MASK_PAD),hs.per_query_head ? hparams.n_head(il) : 1,1,
++                              count*4, count*GGML_PAD(ubatch.n_tokens,GGML_KQ_MASK_PAD)*4,
++                              count*GGML_PAD(ubatch.n_tokens,GGML_KQ_MASK_PAD)*4,0);
++    }
++    if (!hs.enabled || !hs.external) {
++        k = mctx_cur->get_k(ctx0, il);
++        v = mctx_cur->get_v(ctx0, il);
++    }
+     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, v_mla, kq_scale);
+     cb(cur, "kqv_out", il);
+ 
+diff --git a/src/llama-kv-cache-unified.cpp b/src/llama-kv-cache-unified.cpp
+index 321dc79..3e4e2c9 100644
+--- a/src/llama-kv-cache-unified.cpp
++++ b/src/llama-kv-cache-unified.cpp
+@@ -93,7 +93,16 @@ llama_kv_cache_unified::llama_kv_cache_unified(
+                 __func__, hparams.n_embd_v_gqa_max());
+     }
+ 
++    const auto hs = llama_hillserve_configuration();
++    if (hs.enabled && hs.external) {
++        if ((model.arch != LLM_ARCH_QWEN2 && model.arch != LLM_ARCH_LLAMA) || n_stream != 1 || n_seq_max != 1 ||
++            type_k != GGML_TYPE_F16 || type_v != GGML_TYPE_F16 || !v_trans || !offload) {
++            throw std::runtime_error("HillServe: unsupported cache/model mode");
++        }
++        LLAMA_LOG_INFO("HillServe: native all-layer KV payload allocation disabled\n");
++    }
+     for (uint32_t il = 0; il < n_layer_cache; il++) {
++        if (hs.enabled && hs.external) continue;
+         if (filter && !filter(il)) {
+             LLAMA_LOG_DEBUG("%s: layer %3d: skipped\n", __func__, il);
+             continue;
+diff --git a/src/llama-kv-cache-unified.h b/src/llama-kv-cache-unified.h
+index 3e28e34..599fe5c 100644
+--- a/src/llama-kv-cache-unified.h
++++ b/src/llama-kv-cache-unified.h
+@@ -143,6 +143,7 @@ public:
+     // llama_kv_cache_unified specific API
+     //
+ 
++    size_t hillserve_buffer_bytes() const { size_t n=0; for (const auto & b:bufs) n+=ggml_backend_buffer_get_size(b.get()); return n; }
+     uint32_t get_size()     const;
+     uint32_t get_n_stream() const;
+ 
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 71f89e1..886fa5e 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -5599,6 +5599,7 @@ struct llm_build_llama : public llm_graph_context {
+ 
+         ggml_tensor * cur;
+         ggml_tensor * inpL;
++        ggml_tensor * hs_previous_norm = nullptr;
+ 
+         inpL = build_inp_embd(model.tok_embd);
+ 
+@@ -5619,12 +5620,28 @@ struct llm_build_llama : public llm_graph_context {
+                     model.layers[il].attn_norm, NULL,
+                     LLM_NORM_RMS, il);
+             cb(cur, "attn_norm", il);
++            auto * hs_current_norm = cur;
+ 
+             // self-attention
+             {
+                 // rope freq factors for llama3; may return nullptr for llama2 and other models
+                 ggml_tensor * rope_factors = model.get_rope_factors(cparams, il);
+ 
++                // Live rehearsal for target layer from preceding layer attention RMSNorm input.
++                // Same target Wq, current position and target RoPE; never future/pre-recorded queries.
++                const auto hs = llama_hillserve_configuration();
++                if (hs.enabled && hs.per_query_head && n_tokens == 1 && il >= 2) {
++                    GGML_ASSERT(hs_previous_norm);
++                    auto * rehearsal = build_lora_mm(model.layers[il].wq, hs_previous_norm);
++                    if (model.layers[il].bq) rehearsal = ggml_add(ctx0, rehearsal, model.layers[il].bq);
++                    rehearsal = ggml_reshape_3d(ctx0, rehearsal, n_embd_head, n_head, n_tokens);
++                    rehearsal = ggml_rope_ext(ctx0, rehearsal, inp_pos, rope_factors,
++                        n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
++                        ext_factor, attn_factor, beta_fast, beta_slow);
++                    rehearsal = ggml_cont(ctx0, rehearsal);
++                    ggml_format_name(rehearsal, "hs_rehearsal_%d", il);
++                    ggml_build_forward_expand(gf, rehearsal);
++                }
+                 // compute Q and K and RoPE them
+                 ggml_tensor * Qcur = build_lora_mm(model.layers[il].wq, cur);
+                 cb(Qcur, "Qcur", il);
+@@ -5671,6 +5688,7 @@ struct llm_build_llama : public llm_graph_context {
+                         model.layers[il].wo, model.layers[il].bo,
+                         Qcur, Kcur, Vcur, nullptr, nullptr, kq_scale, il);
+                 cb(cur, "attn_out", il);
++                hs_previous_norm = hs_current_norm;
+             }
+ 
+             if (il == n_layer - 1 && inp_out_ids) {
+diff --git a/src/llama.cpp b/src/llama.cpp
+index 34906cd..2d79192 100644
+--- a/src/llama.cpp
++++ b/src/llama.cpp
+@@ -1,4 +1,7 @@
+ #include "llama-impl.h"
++#include "llama-context.h"
++#include "llama-kv-cache-unified.h"
++#include <set>
+ 
+ #include "llama-chat.h"
+ #include "llama-mmap.h"
+@@ -356,3 +359,37 @@ const char * llama_print_system_info(void) {
+     return s.c_str();
+ }
+ 
++
++static thread_local llama_hillserve_config hs_config{};
++void llama_hillserve_configure(const llama_hillserve_config * c) { hs_config = c ? *c : llama_hillserve_config{}; }
++llama_hillserve_config llama_hillserve_configuration(void) { return hs_config; }
++size_t llama_hillserve_graph_bytes(llama_context * ctx, bool gpu) {
++    size_t bytes = 0;
++    auto sched = ctx->get_sched();
++    for (int i=0;i<ggml_backend_sched_get_n_backends(sched);++i) {
++        auto backend = ggml_backend_sched_get_backend(sched,i);
++        auto device = ggml_backend_get_device(backend);
++        bool is_gpu = device && ggml_backend_dev_type(device)==GGML_BACKEND_DEVICE_TYPE_GPU;
++        if (gpu == is_gpu) bytes += ggml_backend_sched_get_buffer_size(sched,backend);
++    }
++    return bytes;
++}
++
++size_t llama_hillserve_native_kv_bytes(llama_context * ctx) {
++    auto * cache = dynamic_cast<llama_kv_cache_unified *>(ctx->get_memory());
++    GGML_ASSERT(cache);
++    return cache->hillserve_buffer_bytes();
++}
++size_t llama_hillserve_weight_bytes(llama_model * model, bool gpu) {
++    std::set<ggml_backend_buffer_t> buffers;
++    size_t bytes=0;
++    for (const auto & entry : model->tensors_by_name) {
++        auto * t=entry.second;
++        auto * b=t->buffer ? t->buffer : t->view_src ? t->view_src->buffer : nullptr;
++        if (!b || !buffers.insert(b).second) continue;
++        auto dev=ggml_backend_buft_get_device(ggml_backend_buffer_get_type(b));
++        bool is_gpu=dev && ggml_backend_dev_type(dev)==GGML_BACKEND_DEVICE_TYPE_GPU;
++        if (gpu==is_gpu) bytes+=ggml_backend_buffer_get_size(b);
++    }
++    return bytes;
++}

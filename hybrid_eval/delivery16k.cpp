@@ -1,0 +1,62 @@
+#include "runtime/gqa_delivery.hpp"
+#include "smartssd/adapter.hpp"
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/stat.h>
+#include <sys/resource.h>
+#include <cerrno>
+#include <future>
+#include <thread>
+#include <set>
+#include <iostream>
+using namespace hillserve;using namespace hillserve::replay;
+static std::uint64_t now_ns(){return std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count();}
+struct DirectInput {
+ int fd=-1;void* buffer=nullptr;std::size_t capacity,extent;std::uint64_t bytes=0,calls=0;
+ DirectInput(const std::string& path,std::size_t cap):capacity((cap+4095)/4096*4096){fd=open(path.c_str(),O_RDONLY|O_DIRECT|O_CLOEXEC|O_NOFOLLOW);need(fd>=0,"O_DIRECT input open failed");struct stat st{};need(!fstat(fd,&st)&&S_ISREG(st.st_mode),"existing regular file required");extent=st.st_size;need(posix_memalign(&buffer,4096,capacity)==0,"bounded read buffer allocation");}
+ ~DirectInput(){if(fd>=0)close(fd);free(buffer);}
+ const std::uint8_t* read(std::size_t off,std::size_t size){need(off%4096==0&&size%4096==0&&off+size<=extent&&size<=capacity,"bounded aligned read");ssize_t got;do{got=pread(fd,buffer,size,off);}while(got<0&&errno==EINTR);need(got==ssize_t(size),"short O_DIRECT read; no fallback");bytes+=size;++calls;return static_cast<const std::uint8_t*>(buffer);}
+};
+static std::vector<std::uint16_t> cpu_scores(const std::vector<std::uint16_t>& q,const std::uint16_t* k,std::size_t n,std::size_t d,unsigned threads){
+ std::vector<std::uint16_t> out(32*n);auto worker=[&](unsigned index){for(std::size_t h=index;h<32;h+=threads){std::vector<float> query(d);for(std::size_t c=0;c<d;++c)query[c]=half_value(q[h*d+c]);for(std::size_t t=0;t<n;++t){float sum=0;for(std::size_t c=0;c<d;++c)sum+=query[c]*half_value(k[(h*n+t)*d+c]);out[h*n+t]=half_bits(sum);}}};
+ std::vector<std::thread> workers;for(unsigned i=1;i<threads;++i)workers.emplace_back(worker,i);worker(0);for(auto&t:workers)t.join();return out;
+}
+struct Fetched {std::vector<std::uint64_t> physical;std::vector<std::uint8_t> payload;std::uint64_t cold_payload=0,hot_payload=0;};
+static Fetched gather(DirectInput& file,const std::vector<std::uint8_t>& hot,const policy::GQASelection& selected,std::size_t cold){
+ std::set<std::uint64_t> union_ids;for(const auto& h:selected.ids)union_ids.insert(h.begin(),h.end());Fetched r;r.physical.assign(union_ids.begin(),union_ids.end());r.payload.resize(r.physical.size()*4096);
+ for(std::size_t i=0;i<r.physical.size();){auto id=r.physical[i];if(id>=cold){need((id-cold+1)*4096<=hot.size(),"hot KV bounds");std::memcpy(r.payload.data()+i*4096,hot.data()+(id-cold)*4096,4096);r.hot_payload+=4096;++i;continue;}
+  auto j=i+1;while(j<r.physical.size()&&r.physical[j]<cold&&(r.physical[j]-id+1)*4096<=65536)++j;
+  auto data=file.read(id*4096,(r.physical[j-1]-id+1)*4096);for(auto s=i;s<j;++s){std::memcpy(r.payload.data()+s*4096,data+(r.physical[s]-id)*4096,4096);r.cold_payload+=4096;}i=j;
+ }return r;
+}
+int main(int argc,char**argv){
+ if(argc!=7){std::cerr<<"TRACE_DIR COLD_SCORE COLD_KV COLD_COUNT CPU_RETURN|HILLSERVE NEW_OUTPUT\n";return 2;}const std::filesystem::path trace=argv[1],out=argv[6];if(!std::filesystem::create_directory(out))return 2;
+ try{json m;std::ifstream(trace/"manifest.json")>>m;need(m.at("status")=="passed","verified checkpoint required");const std::size_t P=m.at("P"),valid=m.at("valid_candidates"),n=m.at("capacity"),d=m.at("compact_channels_padded"),cold=std::stoul(argv[4]);const std::string method=argv[5];bool fpga=method=="HILLSERVE";
+  need((method=="CPU_RETURN"||fpga)&&((P==8192&&cold==5120)||(P==16384&&cold==10240))&&valid==P+1&&d==49,"finite actual mixed checkpoint bounds");
+  const std::size_t hot_count=n-cold,slots=std::max<std::size_t>(32,((std::size_t(std::floor(float(valid)*.2f))+31)/32)*32),workspace=slots*4096*4+slots*64*32*4,cold_bytes=32*cold*d*2,hot_key_bytes=32*hot_count*d*2;
+  const std::uint64_t reservation=workspace+cold_bytes+hot_key_bytes+(valid-cold)*4096+valid*4096+8*32*n+16*32*std::size_t(std::floor(float(valid)*.2f))+128*valid+16ULL*1024*1024;
+  need(reservation<=268435456,"combined mixed host budget exceeded before allocation");
+  auto q=load<std::uint16_t>(trace/"query-f16.bin",32*d),oracle=load<std::uint16_t>(trace/"raw-score-oracle.bin",32*n);auto ids_oracle=load<std::uint64_t>(trace/"selected-ids.bin",32*m.at("selected_per_head").get<std::size_t>());auto actual_q=load<float>(trace/"actual-attention-query-f32.bin",4096);
+  std::vector<std::uint16_t> hot_keys(32*hot_count*d);std::ifstream key_source(trace/"score-compact.bin",std::ios::binary);for(std::size_t h=0;h<32;++h){key_source.seekg((h*n+cold)*d*2);key_source.read(reinterpret_cast<char*>(hot_keys.data()+h*hot_count*d),hot_count*d*2);need(bool(key_source),"hot key region read");}key_source.close();
+  std::vector<std::uint8_t> hot_kv((valid-cold)*4096);std::ifstream kv_source(trace/"kv-physical.bin",std::ios::binary);kv_source.seekg(cold*4096);kv_source.read(reinterpret_cast<char*>(hot_kv.data()),hot_kv.size());need(bool(kv_source),"hot KV initialization");
+  DirectInput cold_keys(argv[2],cold_bytes),cold_kv(argv[3],65536);need(cold_keys.extent==cold_bytes&&cold_kv.extent==cold*4096,"exact shared cold file extents");GQADeliveryWorkspace gpu(slots,actual_q);
+  HardwareContract c;c.abi="HS_PARTIAL_F16_V1";c.image_execute_authorized=true;c.image_path="build/partial-f16-hw/hillserve_partial_f16_250.xclbin";c.image_sha256="c48f86d51667edf8f9142e98e6c99c8c108aaa40acb05cba0ab4da03c6f91c35";c.reuse_file_buffers=true;
+  std::unique_ptr<FpgaScoreBackend> device;double initialization_ms=0;if(fpga){auto t=Clock::now();device=make_fpga_backend(HardwareMode::fpga_storage_streaming,c);initialization_ms=milliseconds(t);}
+  // Cold rows and hot rows retain original global IDs; both branches join before selection.
+  std::ofstream records(out/"runs.jsonl");for(int repeat=0;repeat<2;++repeat){const auto phase=repeat?"measured":"warmup";auto before_read=cold_keys.bytes,before_kv=cold_kv.bytes,before_kv_calls=cold_kv.calls;
+   const auto query_ready=now_ns();std::vector<std::uint16_t> raw(32*n);std::uint64_t hot_start=0,hot_end=0;
+   auto hot_future=std::async(std::launch::async,[&]{hot_start=now_ns();auto r=cpu_scores(q,hot_keys.data(),hot_count,d,1);hot_end=now_ns();return r;});
+   const auto cold_start=now_ns();std::vector<std::uint16_t> cold_scores;FileDeviceScores hw;double cold_read_ms=0,cpu_cold_ms=0;
+   if(fpga){hw=device->score_file(q,{cold_keys.fd,0,cold_bytes,false},32,cold,d);cold_scores=std::move(hw.values);cold_read_ms=hw.file_read_ms;}
+   else{auto t=Clock::now();auto keys=reinterpret_cast<const std::uint16_t*>(cold_keys.read(0,cold_bytes));cold_read_ms=milliseconds(t);t=Clock::now();cold_scores=cpu_scores(q,keys,cold,d,3);cpu_cold_ms=milliseconds(t);}
+   const auto cold_end=now_ns();auto hot_scores=hot_future.get();auto merge_start=Clock::now();for(std::size_t h=0;h<32;++h){std::copy_n(cold_scores.data()+h*cold,cold,raw.data()+h*n);std::copy_n(hot_scores.data()+h*hot_count,hot_count,raw.data()+h*n+cold);}auto normalized=scaled(raw);double merge_ms=milliseconds(merge_start);const auto scores_ready=now_ns();
+   auto t=Clock::now();auto selected=policy::select_gqa_scores(normalized,32,n,valid,5,.2f);need(selected.k>0&&selected.k<=slots,"actual global selected cardinality");double select_ms=milliseconds(t);auto ids_ready=now_ns();t=Clock::now();auto fetched=gather(cold_kv,hot_kv,selected,cold);double gather_ms=milliseconds(t);const auto host_ready=now_ns();auto delivery=gpu.deliver(selected.ids,P,fetched.physical,fetched.payload);const double total_ms=(delivery.gpu_ready_ns-query_ready)/1e6;
+   // Correctness and attention consumption occur after the delivery completion endpoint.
+   need(raw==oracle,"mixed host/FPGA raw scores differ from frozen expanded128 oracle");need(flatten(selected)==ids_oracle,"mixed global selected ID order differs");std::vector<std::uint8_t> expected(4096);std::uint64_t kv_errors=0;for(std::size_t i=0;i<fetched.physical.size();++i){kv_source.seekg(fetched.physical[i]*4096);kv_source.read(reinterpret_cast<char*>(expected.data()),4096);need(bool(kv_source),"frozen original KV verify read");for(std::size_t b=0;b<4096;++b)kv_errors+=expected[b]!=fetched.payload[i*4096+b];}need(kv_errors==0,"selected original KV bytes differ");auto gpu_validation=gpu.verify_and_consume();
+   double overlap=std::max<std::int64_t>(0,std::int64_t(std::min(hot_end,cold_end))-std::int64_t(std::max(hot_start,cold_start)))/1e6;struct rusage usage{};getrusage(RUSAGE_SELF,&usage);
+   json row={{"status","passed"},{"phase",phase},{"method",method},{"classification","actual_single_layer_mixed_KV_GPU_delivery_replay"},{"P",P},{"B",1},{"layer",8},{"valid_candidates",valid},{"kernel_capacity",n},{"cold_positions",cold},{"cold_fraction",double(cold)/valid},{"hot_valid_positions",valid-cold},{"channels",d},{"normalization_dimension",128},{"query_ready_ns",query_ready},{"cold_started_ns",cold_start},{"cold_finished_ns",cold_end},{"hot_started_ns",hot_start},{"hot_finished_ns",hot_end},{"scores_ready_ns",scores_ready},{"global_ID_ready_ns",ids_ready},{"KV_host_ready_ns",host_ready},{"KV_mask_GPU_ready_ns",delivery.gpu_ready_ns},{"T_delivery_ms",total_ms},{"cold_service_ms",(cold_end-cold_start)/1e6},{"cold_file_read_ms",cold_read_ms},{"CPU_cold_score_ms",fpga?json(nullptr):json(cpu_cold_ms)},{"FPGA_launch_wait_ms",fpga?json(hw.timings.launch_wait_ms):json(nullptr)},{"FPGA_score_return_ms",fpga?json(hw.timings.d2h_ms):json(nullptr)},{"hot_CPU_score_ms",(hot_end-hot_start)/1e6},{"hot_cold_actual_overlap_ms",overlap},{"merge_scale_ms",merge_ms},{"select_ms",select_ms},{"selected_KV_gather_ms",gather_ms},{"GPU_pack_ms",delivery.pack_ms},{"GPU_upload_wall_ms",delivery.upload_wall_ms},{"GPU_copy_stream_interval_ms",delivery.cuda_copy_stream_interval_ms},{"BO_allocation_ms",hw.timings.allocation_ms},{"BO_reused",hw.bo_reused},{"cold_key_read_bytes",fpga?hw.file_read_bytes:cold_keys.bytes-before_read},{"cold_candidate_key_SSD_to_host_bytes",fpga?0:cold_bytes},{"cold_candidate_key_SSD_to_P2P_BO_bytes",fpga?hw.file_read_bytes:0},{"query_host_to_FPGA_bytes",hw.query_h2d_bytes},{"scores_FPGA_to_host_bytes",hw.timings.d2h_bytes},{"candidate_key_host_to_FPGA_bytes",0},{"hot_partial_keys_resident_bytes",hot_key_bytes},{"hot_physical_KV_resident_bytes",hot_kv.size()},{"selected_KV_SSD_to_host_syscall_bytes",cold_kv.bytes-before_kv},{"selected_KV_SSD_read_calls",cold_kv.calls-before_kv_calls},{"selected_cold_payload_bytes",fetched.cold_payload},{"selected_hot_RAM_copy_bytes",fetched.hot_payload},{"selected_unique_payload_bytes",fetched.payload.size()},{"logical_selected_per_Qhead_payload_bytes",32*selected.k*512},{"K_host_to_GPU_bytes",slots*4096*2},{"V_host_to_GPU_bytes",slots*4096*2},{"mask_host_to_GPU_bytes",slots*64*32*4},{"GPU_upload_total_bytes",delivery.upload_bytes},{"attention_query_preloaded_bytes_excluded",16384},{"attention_slots_same_as_model_runtime",slots},{"selected_per_head",selected.k},{"selected_ID_checksum",std::to_string(checksum(ids_oracle.data(),ids_oracle.size()*8))},{"physical_payload_checksum",std::to_string(checksum(fetched.payload.data(),fetched.payload.size()))},{"score_bit_errors",0},{"ordered_ID_errors",0},{"KV_byte_errors",kv_errors},{"host_thread_budget",4},{"hot_score_threads",1},{"cold_CPU_score_threads",fpga?0:3},{"host_application_budget_bytes",268435456},{"host_application_reservation_bytes",reservation},{"GPU_budget_bytes",268435456},{"GPU_workspace_and_attention_bytes",gpu.gpu_bytes()},{"FPGA_BO_budget_bytes",c.buffer_budget_bytes},{"process_peak_RSS_KiB",usage.ru_maxrss},{"P2P_BO_verified",hw.p2p_allocation_verified},{"physical_no_bounce_verified",false},{"GPU_need_KV_time","unavailable"},{"actual_GPU_wait_ms",nullptr},{"model_TPOT_ms",nullptr},{"image_sha256",fpga?json(c.image_sha256):json(nullptr)},{"GPU_validation",gpu_validation}};
+   records<<row.dump()<<'\n';records.flush();std::cout<<row.dump()<<'\n';
+  }
+  auto t=Clock::now();device.reset();std::ofstream(out/"summary.json")<<json({{"status","passed"},{"initialization_ms_excluded",initialization_ms},{"persistent_BO_teardown_ms_excluded",milliseconds(t)},{"measured_count",1},{"warmup_count",1},{"cold_key_reload_every_query",true},{"host_budget_reservation_bytes",reservation},{"full_model_feedback_claim",false}}).dump(2)<<'\n';return 0;
+ }catch(const std::exception&e){std::ofstream(out/"error.txt")<<e.what()<<'\n';std::cerr<<e.what()<<'\n';return 1;}
+}

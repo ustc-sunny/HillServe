@@ -1,0 +1,64 @@
+{
+  "abi": "HS_FULL_GQA_PIPELINE_F16_V3",
+  "kernel_name": "hillserve_full_gqa_pipeline",
+  "arguments": [
+    "query_bo",
+    "key_bo",
+    "score_bo",
+    "uint32_tokens"
+  ],
+  "layout": {
+    "query": "F16[32,128] row-major8192bytes",
+    "keys": "F16[N,8,128] token-major2048bytes/token",
+    "scores": "F16[32,N] head-major64bytes/token",
+    "byte_order": "little_endian",
+    "physical_KV_head": "query_head/4",
+    "top_memory_word_bits": 512,
+    "buffer_base_alignment_bytes": 64,
+    "byte_layout_compatible_with_V2_for_supported_N": true
+  },
+  "limits": {
+    "query_heads": 32,
+    "physical_KV_heads": 8,
+    "dimension": 128,
+    "tokens_min": 64,
+    "tokens_max": 32768,
+    "tokens_multiple": 64,
+    "invalid_tokens": "host must reject; kernel no memory accesses",
+    "maximum_key_BO_bytes": 67108864,
+    "maximum_score_BO_bytes": 2097152
+  },
+  "numeric": {
+    "input": "finite IEEE754 F16",
+    "multiply": "FP32 rounded",
+    "accumulation": "FP32 addition ascending channels0..127,initial+0,noFMA/no_reassociation",
+    "output": "F16 round-to-nearest-even after128channels",
+    "normalization_or_selector_in_kernel": false
+  },
+  "implementation": {
+    "tile_tokens": 64,
+    "default_token_parallelism": 4,
+    "requested_F32_multipliers": 128,
+    "requested_F32_adders": 128,
+    "accumulator_revisit_iterations": 16,
+    "requested_compute_II": 1,
+    "requested_pack_II": 1,
+    "requested_key_AXI_bits": 512,
+    "requested_score_AXI_bits": 512,
+    "key_FIFO_words512": 2048,
+    "score_FIFO_words512": 64,
+    "requested_DATAFLOW_tasks": [
+      "read_keys",
+      "compute_scores",
+      "write_scores"
+    ],
+    "compute_local_tile_load_overlaps_its_own_arithmetic": false,
+    "requested_kernel_clock_MHz": 250,
+    "accumulator_bank_layout": "[TOKEN_PAR][8][4][64/TOKEN_PAR],first3dimensions_partitioned,last_dimension_RAM_2P_LUTRAM",
+    "score_pack_parallel_values": 4,
+    "score_pack_steps_per_word512": 8,
+    "key_tile_layout": "word512[TOKEN_PAR][8][64/TOKEN_PAR][4],first2dimensions_partitioned,one_fullword_store_per_input_word",
+    "requested_key_tile_fill_II": 1
+  },
+  "source_origin": "independent_research_code"
+}

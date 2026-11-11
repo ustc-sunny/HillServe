@@ -1,0 +1,92 @@
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -307,6 +307,7 @@
+         uint32_t sparse_slots; // Decoder layers >=2; capacity bound, never implicit truncation.
+         bool early_rehearsal; // Opt-in: emit target-layer Q at preceding attn_norm; callback state must be keyed by target layer.
+         bool native_prefill; // Opt-in native GPU dense phase with live KV export; must release payload before external decode.
++        bool h2o_attention_stats; // Name real non-flash softmax for bounded CUDA statistics; independent of enabled.
+     };
+     LLAMA_API void llama_hillserve_configure(const struct llama_hillserve_config * config);
+     LLAMA_API struct llama_hillserve_config llama_hillserve_configuration(void);
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -1144,14 +1144,18 @@
+          ggml_tensor * kq_b,
+          ggml_tensor * kq_mask,
+          ggml_tensor * v_mla,
+-             float     kq_scale) const {
++             float     kq_scale,
++             int       il) const {
+     // External KV is updated by the hs_append callback. Keep its attention
+     // consumers on the actual KV device: a CPU split could otherwise copy
+     // shared K/V/mask inputs before that callback has installed this layer.
+     // offload_kqv permits offload, but does not itself pin every MHA operation.
+     ggml_backend_t hs_attention_backend = nullptr;
+     const auto hs_attention = llama_hillserve_configuration();
+-    if (hs_attention.enabled && hs_attention.external && hs_attention.per_query_head && cparams.offload_kqv) {
++    if (hs_attention.h2o_attention_stats && cparams.flash_attn) {
++        throw std::runtime_error("HillServe: H2O statistics requires actual non-flash attention probabilities");
++    }
++    if (hs_attention.enabled && hs_attention.external && cparams.offload_kqv) {
+         if (cparams.flash_attn || !hs_attention.k || !hs_attention.k->buffer ||
+                 ggml_backend_buffer_is_host(hs_attention.k->buffer)) {
+             throw std::runtime_error("HillServe: external MHA requires non-host GPU KV and non-flash attention");
+@@ -1265,6 +1269,10 @@
+ 
+         kq = ggml_soft_max_ext(ctx0, kq, kq_mask, kq_scale, hparams.f_max_alibi_bias);
+         pin_hs_attention(kq);
++        if (hs_attention.h2o_attention_stats) {
++            GGML_ASSERT(kq->type == GGML_TYPE_F32);
++            ggml_format_name(kq, "hs_h2o_prob_%d", il);
++        }
+ 
+         if (!v_trans) {
+             // note: avoid this branch
+@@ -1342,7 +1350,7 @@
+     ggml_tensor * k = k_cur;
+     ggml_tensor * v = v_cur;
+ 
+-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, v_mla, kq_scale);
++    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, v_mla, kq_scale, il);
+     cb(cur, "kqv_out", il);
+ 
+     if (wo) {
+@@ -1459,7 +1467,7 @@
+         k = mctx_cur->get_k(ctx0, il);
+         v = mctx_cur->get_v(ctx0, il);
+     }
+-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, v_mla, kq_scale);
++    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, v_mla, kq_scale, il);
+     cb(cur, "kqv_out", il);
+ 
+     if (wo) {
+@@ -1525,7 +1533,7 @@
+     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+ 
+-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, v_mla, kq_scale);
++    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, v_mla, kq_scale, il);
+     cb(cur, "kqv_out", il);
+ 
+     if (wo) {
+@@ -1579,7 +1587,7 @@
+     ggml_tensor * k = k_cur;
+     ggml_tensor * v = v_cur;
+ 
+-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, v_mla, kq_scale);
++    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, v_mla, kq_scale, il);
+     cb(cur, "kqv_out", il);
+ 
+     if (wo) {
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -652,7 +652,8 @@
+              ggml_tensor * kq_b,
+              ggml_tensor * kq_mask,
+              ggml_tensor * v_mla,   // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
+-                   float   kq_scale) const;
++                   float   kq_scale,
++                     int   il) const;
+ 
+     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
+ 

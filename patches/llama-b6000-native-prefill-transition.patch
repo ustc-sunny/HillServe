@@ -1,0 +1,274 @@
+diff --git a/include/llama.h b/include/llama.h
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -306,10 +306,14 @@
+         bool per_query_head; // Independent logical selections sharing physical GQA KV.
+         uint32_t sparse_slots; // Decoder layers >=2; capacity bound, never implicit truncation.
+         bool early_rehearsal; // Opt-in: emit target-layer Q at preceding attn_norm; callback state must be keyed by target layer.
++        bool native_prefill; // Opt-in native GPU dense phase with live KV export; must release payload before external decode.
+     };
+     LLAMA_API void llama_hillserve_configure(const struct llama_hillserve_config * config);
+     LLAMA_API struct llama_hillserve_config llama_hillserve_configuration(void);
+     LLAMA_API size_t llama_hillserve_native_kv_bytes(struct llama_context * ctx);
++    LLAMA_API size_t llama_hillserve_native_gpu_kv_bytes(struct llama_context * ctx);
++    // Synchronous one-way transition. Keeps sequence positions, never KV payload.
++    LLAMA_API size_t llama_hillserve_finish_native_prefill(struct llama_context * ctx, uint32_t expected_tokens);
+     LLAMA_API size_t llama_hillserve_weight_bytes(struct llama_model * model, bool gpu);
+     LLAMA_API size_t llama_hillserve_graph_bytes(struct llama_context * ctx, bool gpu);
+     LLAMA_API void llama_hillserve_set_profile(struct llama_context * ctx, ggml_backend_sched_profile_callback callback, void * user_data);
+diff --git a/src/llama-context.h b/src/llama-context.h
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -45,6 +45,7 @@
+     uint32_t n_threads_batch() const;
+ 
+     llama_memory_t get_memory() const;
++    size_t hillserve_finish_native_prefill(uint32_t expected_tokens);
+ 
+     // return true of the KV cache was updated
+     // TODO: remove
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -6,6 +6,7 @@
+ #include "llama-memory.h"
+ #include "llama-mmap.h"
+ #include "llama-model.h"
++#include "llama-kv-cache-unified.h"
+ 
+ #include <cinttypes>
+ #include <cstring>
+@@ -56,6 +57,10 @@
+                                                               hparams.n_ctx_train;
+ 
+     const auto hs = llama_hillserve_configuration();
++    if (hs.native_prefill && (!hs.enabled || hs.external || hs.per_query_head ||
++        model.arch != LLM_ARCH_LLAMA || model.params.n_gpu_layers <= int(model.hparams.n_layer))) {
++        throw std::runtime_error("HillServe native prefill requires all-GPU Llama weights and native GQA layout");
++    }
+     if (hs.enabled && (!params.cb_eval || params.flash_attn || params.n_seq_max != 1 ||
+         !params.offload_kqv || (model.arch != LLM_ARCH_QWEN2 && model.arch != LLM_ARCH_LLAMA))) {
+         throw std::runtime_error("HillServe requires Qwen2 or Llama, one sequence, GPU attention and runtime callback");
+@@ -438,6 +443,22 @@
+ 
+ llama_memory_t llama_context::get_memory() const {
+     return memory.get();
++}
++
++size_t llama_context::hillserve_finish_native_prefill(uint32_t expected_tokens) {
++    const auto hs = llama_hillserve_configuration();
++    if (!hs.enabled || !hs.native_prefill || hs.external || hs.per_query_head) {
++        throw std::runtime_error("HillServe native prefill transition outside native phase");
++    }
++    auto * cache = dynamic_cast<llama_kv_cache_unified *>(memory.get());
++    if (!cache) throw std::runtime_error("HillServe native prefill requires unified KV metadata");
++    synchronize();
++    // Clear scheduler references and both retained graphs before freeing their
++    // native cache leaves. The host logits buffer survives graph invalidation.
++    ggml_backend_sched_reset(sched.get());
++    gf_res_prev->reset();
++    gf_res_reserve->reset();
++    return cache->hillserve_release_payload(expected_tokens);
+ }
+ 
+ // deprecated
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -313,7 +313,7 @@
+         mctx->set_input_v_idxs(self_v_idxs, ubatch);
+     }
+     // Hook mode supplies a live mask at the synchronized per-layer barrier.
+-    if (!hs.enabled) mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
++    if (!hs.enabled || hs.native_prefill) mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
+ }
+ 
+ bool llm_graph_input_attn_kv_unified::can_reuse(const llm_graph_params & params) {
+@@ -1435,7 +1435,9 @@
+         }
+         uint32_t count = hs.external ? std::min(hs.slots, mctx_cur->get_n_kv()) : mctx_cur->get_n_kv();
+         if (hs.per_query_head && hs.sparse_slots && ubatch.n_tokens == 1 && il >= 2) count = std::min(count, hs.sparse_slots);
+-        if (count > hs.slots) throw std::runtime_error("HillServe: mask capacity");
++        // Native context graph reservation may use padded n_ctx larger than
++        // the external file capacity; its own mask/cache have that full extent.
++        if (!hs.native_prefill && count > hs.slots) throw std::runtime_error("HillServe: mask capacity");
+         // This op materializes current post-RoPE K and raw V on GPU. Its completion is the I/O boundary.
+         auto * current = ggml_cast(ctx0, ggml_concat(ctx0, k_cur, v_cur, 0), GGML_TYPE_F16);
+         ggml_format_name(current, "hs_append_%d_%u", il, count);
+@@ -1447,9 +1449,11 @@
+             const auto stride = hs.per_query_head ? count : hs.slots;
+             v = ggml_view_4d(ctx0, hs.v, count,h,d,1, stride*d*2,stride*2,stride*d*h*2,0);
+         }
+-        kq_mask = ggml_view_4d(ctx0, hs.mask, count,GGML_PAD(ubatch.n_tokens,GGML_KQ_MASK_PAD),hs.per_query_head ? hparams.n_head(il) : 1,1,
+-                              count*4, count*GGML_PAD(ubatch.n_tokens,GGML_KQ_MASK_PAD)*4,
+-                              count*GGML_PAD(ubatch.n_tokens,GGML_KQ_MASK_PAD)*4,0);
++        if (!hs.native_prefill) {
++            kq_mask = ggml_view_4d(ctx0, hs.mask, count,GGML_PAD(ubatch.n_tokens,GGML_KQ_MASK_PAD),hs.per_query_head ? hparams.n_head(il) : 1,1,
++                                  count*4, count*GGML_PAD(ubatch.n_tokens,GGML_KQ_MASK_PAD)*4,
++                                  count*GGML_PAD(ubatch.n_tokens,GGML_KQ_MASK_PAD)*4,0);
++        }
+     }
+     if (!hs.enabled || !hs.external) {
+         k = mctx_cur->get_k(ctx0, il);
+diff --git a/src/llama-kv-cache-unified.h b/src/llama-kv-cache-unified.h
+--- a/src/llama-kv-cache-unified.h
++++ b/src/llama-kv-cache-unified.h
+@@ -144,6 +144,8 @@
+     //
+ 
+     size_t hillserve_buffer_bytes() const { size_t n=0; for (const auto & b:bufs) n+=ggml_backend_buffer_get_size(b.get()); return n; }
++    size_t hillserve_gpu_buffer_bytes() const;
++    size_t hillserve_release_payload(uint32_t expected_tokens);
+     uint32_t get_size()     const;
+     uint32_t get_n_stream() const;
+ 
+@@ -216,6 +218,7 @@
+     };
+ 
+     bool v_trans = true;  // the value tensor is transposed
++    bool hillserve_payload_released = false;
+ 
+     const uint32_t n_seq_max = 1;
+     const uint32_t n_stream  = 1;
+diff --git a/src/llama-kv-cache-unified.cpp b/src/llama-kv-cache-unified.cpp
+--- a/src/llama-kv-cache-unified.cpp
++++ b/src/llama-kv-cache-unified.cpp
+@@ -94,12 +94,12 @@
+     }
+ 
+     const auto hs = llama_hillserve_configuration();
+-    if (hs.enabled && hs.external) {
++    if (hs.enabled && (hs.external || hs.native_prefill)) {
+         if ((model.arch != LLM_ARCH_QWEN2 && model.arch != LLM_ARCH_LLAMA) || n_stream != 1 || n_seq_max != 1 ||
+             type_k != GGML_TYPE_F16 || type_v != GGML_TYPE_F16 || !v_trans || !offload) {
+             throw std::runtime_error("HillServe: unsupported cache/model mode");
+         }
+-        LLAMA_LOG_INFO("HillServe: native all-layer KV payload allocation disabled\n");
++        if (hs.external) LLAMA_LOG_INFO("HillServe: native all-layer KV payload allocation disabled\n");
+     }
+     for (uint32_t il = 0; il < n_layer_cache; il++) {
+         if (hs.enabled && hs.external) continue;
+@@ -214,6 +214,45 @@
+     }
+ }
+ 
++size_t llama_kv_cache_unified::hillserve_gpu_buffer_bytes() const {
++    size_t bytes = 0;
++    for (const auto & buffer : bufs) {
++        auto * dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(buffer.get()));
++        if (!ggml_backend_buffer_is_host(buffer.get()) && dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
++            bytes += ggml_backend_buffer_get_size(buffer.get());
++        }
++    }
++    return bytes;
++}
++
++size_t llama_kv_cache_unified::hillserve_release_payload(uint32_t expected_tokens) {
++    const auto hs = llama_hillserve_configuration();
++    const size_t bytes = hillserve_buffer_bytes();
++    if (hillserve_payload_released || !hs.native_prefill || hs.external || !expected_tokens ||
++        n_stream != 1 || n_seq_max != 1 || v_cells.size() != 1 || layers.size() != 32 ||
++        get_has_shift() || !sc_info.empty() || !bytes || hillserve_gpu_buffer_bytes() != bytes) {
++        throw std::runtime_error("HillServe native payload release requires one intact GPU-only prompt");
++    }
++    const auto & cells = v_cells[0];
++    if (cells.get_used() != expected_tokens || cells.used_max_p1() != expected_tokens) {
++        throw std::runtime_error("HillServe native prompt metadata is not the exported contiguous prefix");
++    }
++    for (uint32_t i = 0; i < expected_tokens; ++i) {
++        if (cells.pos_get(i) != llama_pos(i) || !cells.seq_has(i, 0)) {
++            throw std::runtime_error("HillServe native prompt position/sequence differs from external export");
++        }
++    }
++    // Called only after context synchronization and scheduler/graph reset.
++    // Keep cells, heads and stream mapping so decode continues at the same
++    // position; never call clear(), which would discard that sequence state.
++    bufs.clear();
++    layers.clear();
++    map_layer_ids.clear();
++    ctxs.clear();
++    hillserve_payload_released = true;
++    return bytes;
++}
++
+ void llama_kv_cache_unified::clear(bool data) {
+     for (uint32_t s = 0; s < n_stream; ++s) {
+         v_cells[s].reset();
+@@ -501,6 +540,18 @@
+             break;
+         }
+ 
++        if (hillserve_payload_released) {
++            const auto hs = llama_hillserve_configuration();
++            const auto & cells = v_cells[0];
++            const auto next = cells.get_used();
++            if (!hs.enabled || !hs.external || hs.native_prefill || !hs.per_query_head ||
++                ubatches.size() != 1 || ubatches[0].n_tokens != 1 || next >= hs.slots ||
++                cells.used_max_p1() != next || ubatches[0].pos[0] != llama_pos(next) ||
++                ubatches[0].n_seq_id[0] != 1 || ubatches[0].seq_id[0][0] != 0) {
++                throw std::runtime_error("HillServe released native cache permits only contiguous bounded seq0 external decode");
++            }
++        }
++
+         auto sinfos = prepare(ubatches);
+         if (sinfos.empty()) {
+             break;
+@@ -518,6 +569,15 @@
+ }
+ 
+ llama_memory_context_ptr llama_kv_cache_unified::init_update(llama_context * lctx, bool optimize) {
++    if (hillserve_payload_released) {
++        const auto hs = llama_hillserve_configuration();
++        if (!hs.enabled || !hs.external || hs.native_prefill || get_has_shift() || !sc_info.empty()) {
++            throw std::runtime_error("HillServe released native payload cannot shift/copy/restore native KV");
++        }
++        // A full-cache retry can request optimize=true. Defrag has no payload
++        // to move and assumes a nonzero layer count; skip it explicitly.
++        return std::make_unique<llama_kv_cache_unified_context>(LLAMA_MEMORY_STATUS_NO_UPDATE);
++    }
+     bool do_shift = get_has_shift();
+ 
+     defrag_info dinfo;
+@@ -1003,7 +1063,7 @@
+ }
+ 
+ bool llama_kv_cache_unified::get_can_shift() const {
+-    return true;
++    return !hillserve_payload_released;
+ }
+ 
+ uint32_t llama_kv_cache_unified::get_size() const {
+@@ -1818,6 +1878,7 @@
+ }
+ 
+ void llama_kv_cache_unified::state_write(llama_io_write_i & io, llama_seq_id seq_id) const {
++    if (hillserve_payload_released) throw std::runtime_error("HillServe external KV cannot be saved as a native checkpoint");
+     io.write(&n_stream, sizeof(n_stream));
+ 
+     for (uint32_t s = 0; s < n_stream; ++s) {
+@@ -1869,6 +1930,7 @@
+ }
+ 
+ void llama_kv_cache_unified::state_read(llama_io_read_i & io, llama_seq_id seq_id) {
++    if (hillserve_payload_released) throw std::runtime_error("HillServe external KV cannot restore a native checkpoint");
+     GGML_ASSERT(seq_id == -1 || (seq_id >= 0 && (size_t) seq_id < seq_to_stream.size()));
+ 
+     uint32_t n_stream_cur;
+diff --git a/src/llama.cpp b/src/llama.cpp
+--- a/src/llama.cpp
++++ b/src/llama.cpp
+@@ -380,6 +380,14 @@
+     GGML_ASSERT(cache);
+     return cache->hillserve_buffer_bytes();
+ }
++size_t llama_hillserve_native_gpu_kv_bytes(llama_context * ctx) {
++    auto * cache = dynamic_cast<llama_kv_cache_unified *>(ctx->get_memory());
++    GGML_ASSERT(cache);
++    return cache->hillserve_gpu_buffer_bytes();
++}
++size_t llama_hillserve_finish_native_prefill(llama_context * ctx, uint32_t expected_tokens) {
++    return ctx->hillserve_finish_native_prefill(expected_tokens);
++}
+ size_t llama_hillserve_weight_bytes(llama_model * model, bool gpu) {
+     std::set<ggml_backend_buffer_t> buffers;
+     size_t bytes=0;

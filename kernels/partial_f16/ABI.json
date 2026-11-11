@@ -1,0 +1,26 @@
+{
+  "abi": "HS_PARTIAL_F16_V1",
+  "kernel_name": "hillserve_partial_f16",
+  "arguments": [
+    "query_bo",
+    "key_bo",
+    "score_bo",
+    "uint32_heads",
+    "uint32_tokens",
+    "uint32_channels"
+  ],
+  "layout": {
+    "query": "F16[heads,channels]",
+    "keys": "F16[heads,tokens,channels]",
+    "scores": "F16[heads,tokens]"
+  },
+  "numeric": "ordered FP32 multiply and add, F16 round-nearest-even output; no head reduction, no FMA contraction",
+  "limits_host": {
+    "heads": 32,
+    "tokens": 65504,
+    "channels": 128,
+    "key_bo_bytes": 268435456
+  },
+  "model_mapping": "input producer performs explicit q-head to KV-head/channel mapping; no padding or reinterpretation of legacy images",
+  "source_origin": "independently authored from inspected per-head dot specification"
+}

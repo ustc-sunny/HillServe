@@ -1,0 +1,52 @@
+{
+  "abi": "HS_FULL_GQA_F16_V2",
+  "kernel_name": "hillserve_full_gqa_f16",
+  "arguments": [
+    "query_bo",
+    "key_bo",
+    "score_bo",
+    "uint32_tokens"
+  ],
+  "layout": {
+    "query": "F16[32,128] row-major,8192bytes",
+    "keys": "F16[tokens,8,128] token-major physicalGQA K,2048bytes/token",
+    "scores": "F16[32,tokens] head-major,64bytes/token",
+    "physical_KV_head_for_query_head": "query_head/4",
+    "byte_order": "little_endian"
+  },
+  "numeric": {
+    "input": "finite IEEE754 binary16 raw full-dimensional already-RoPE Q and K",
+    "producer": "caller retains the explicitly selected query source; no kernel query substitution,skew,mask,channel selection,normalization or selector",
+    "product": "binary32 rounded multiply,FP contraction disabled",
+    "accumulation": "binary32 addition in channel order0..127,initial+0,no reassociation",
+    "output": "one binary16 round-to-nearest-even after128 channels",
+    "host_validation": "reject nonfinite inputs and nonfinite output as required by the policy; no fallback"
+  },
+  "limits": {
+    "query_heads": 32,
+    "physical_KV_heads": 8,
+    "dimension": 128,
+    "tokens_min": 1,
+    "tokens_max": 32768,
+    "maximum_key_bo_bytes": 67108864,
+    "maximum_score_bo_bytes": 2097152,
+    "invalid_token_count": "no memory accesses;host must reject before launch"
+  },
+  "implementation": {
+    "tile_tokens": 16,
+    "parallel_query_heads_per_physical_KV_head": 4,
+    "query_cache_bytes": 16384,
+    "key_tile_bytes": 32768,
+    "accumulator_bytes": 2048,
+    "ordered_channel_loop_requested_II": 1,
+    "requested_maximum_m_axi_widen_bits": 512,
+    "independent_score_interleaving": "16token accumulators;one update per lane every16 loop iterations",
+    "arithmetic_parallelism_note": "only independent query heads/tokens;each score retains sequential128-channel arithmetic",
+    "parallel_physical_KV_heads": 8,
+    "key_load_unrolled_elements": 32,
+    "key_tile_banks": 8,
+    "key_tile_channel_reshape_factor": 32
+  },
+  "compatibility": "NOT compatible with HS_PARTIAL_F16_V1 arguments,layout,query artifacts or xclbin",
+  "source_origin": "independently authored research implementation"
+}

@@ -1,0 +1,72 @@
+diff --git a/include/llama.h b/include/llama.h
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -305,6 +305,7 @@
+         bool f32_value_control; // Explicit research control, default remains unchanged.
+         bool per_query_head; // Independent logical selections sharing physical GQA KV.
+         uint32_t sparse_slots; // Decoder layers >=2; capacity bound, never implicit truncation.
++        bool early_rehearsal; // Opt-in: emit target-layer Q at preceding attn_norm; callback state must be keyed by target layer.
+     };
+     LLAMA_API void llama_hillserve_configure(const struct llama_hillserve_config * config);
+     LLAMA_API struct llama_hillserve_config llama_hillserve_configuration(void);
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -5612,6 +5612,21 @@
+ 
+         ggml_tensor * inp_out_ids = build_inp_out_ids();
+ 
++        // Both schedules use the same target weights, position, RoPE and source norm.
++        // The callback owns a copy of this Q; its target layer is encoded in the name.
++        const auto build_hs_rehearsal = [&](int target_layer, ggml_tensor * source_norm) {
++            GGML_ASSERT(source_norm);
++            auto * rehearsal = build_lora_mm(model.layers[target_layer].wq, source_norm);
++            if (model.layers[target_layer].bq) rehearsal = ggml_add(ctx0, rehearsal, model.layers[target_layer].bq);
++            rehearsal = ggml_reshape_3d(ctx0, rehearsal, n_embd_head, n_head, n_tokens);
++            rehearsal = ggml_rope_ext(ctx0, rehearsal, inp_pos, model.get_rope_factors(cparams, target_layer),
++                n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
++                ext_factor, attn_factor, beta_fast, beta_slow);
++            rehearsal = ggml_cont(ctx0, rehearsal);
++            ggml_format_name(rehearsal, "hs_rehearsal_%d", target_layer);
++            ggml_build_forward_expand(gf, rehearsal);
++        };
++
+         for (int il = 0; il < n_layer; ++il) {
+             ggml_tensor * inpSA = inpL;
+ 
+@@ -5622,6 +5637,14 @@
+             cb(cur, "attn_norm", il);
+             auto * hs_current_norm = cur;
+ 
++            const auto hs = llama_hillserve_configuration();
++            if (hs.enabled && hs.per_query_head && hs.early_rehearsal && hs.sparse_slots > 0 && n_tokens == 1 && il >= 1 && il + 1 < n_layer) {
++                // First two layers stay dense. Only target >=2 historical scores
++                // can start here; target current-token K and final selection wait
++                // for that layer's hs_append barrier.
++                build_hs_rehearsal(il + 1, hs_current_norm);
++            }
++
+             // self-attention
+             {
+                 // rope freq factors for llama3; may return nullptr for llama2 and other models
+@@ -5629,18 +5652,8 @@
+ 
+                 // Live rehearsal for target layer from preceding layer attention RMSNorm input.
+                 // Same target Wq, current position and target RoPE; never future/pre-recorded queries.
+-                const auto hs = llama_hillserve_configuration();
+-                if (hs.enabled && hs.per_query_head && n_tokens == 1 && il >= 2) {
+-                    GGML_ASSERT(hs_previous_norm);
+-                    auto * rehearsal = build_lora_mm(model.layers[il].wq, hs_previous_norm);
+-                    if (model.layers[il].bq) rehearsal = ggml_add(ctx0, rehearsal, model.layers[il].bq);
+-                    rehearsal = ggml_reshape_3d(ctx0, rehearsal, n_embd_head, n_head, n_tokens);
+-                    rehearsal = ggml_rope_ext(ctx0, rehearsal, inp_pos, rope_factors,
+-                        n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
+-                        ext_factor, attn_factor, beta_fast, beta_slow);
+-                    rehearsal = ggml_cont(ctx0, rehearsal);
+-                    ggml_format_name(rehearsal, "hs_rehearsal_%d", il);
+-                    ggml_build_forward_expand(gf, rehearsal);
++                if (hs.enabled && hs.per_query_head && !hs.early_rehearsal && hs.sparse_slots > 0 && n_tokens == 1 && il >= 2) {
++                    build_hs_rehearsal(il, hs_previous_norm);
+                 }
+                 // compute Q and K and RoPE them
+                 ggml_tensor * Qcur = build_lora_mm(model.layers[il].wq, cur);

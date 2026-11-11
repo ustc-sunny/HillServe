@@ -1,0 +1,9 @@
+{
+  "repository": "https://github.com/ggml-org/llama.cpp.git",
+  "tag": "b6000",
+  "commit": "4762ad7316dcdec20016ab5985fb46a27902204d",
+  "license": "MIT",
+  "checkout_path": "third_party/llama.cpp",
+  "upstream_modified": false,
+  "adapter_path": "adapters/llama_cpp"
+}

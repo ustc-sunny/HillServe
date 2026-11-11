@@ -1,0 +1,45 @@
+build/
+third_party/
+models/
+results/
+tmp/
+__pycache__/
+*.pyc
+.DS_Store
+environment.json
+
+# Private artifacts and credentials are never repository inputs.
+*.gguf
+*.safetensors
+*.xclbin
+*.pdf
+*.bin
+*.bundle
+traces/
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+.ssh/
+
+# Generated Vitis/Vivado project products and logs.
+.ipcache/
+/vitis_hls.log
+/vivado.jou
+/vivado.log
+/xcd.log
+/xrc.log
+
+# Local inputs, deployment configuration, and generated execution records.
+inputs/
+outputs/
+scratch/
+local/
+*.log
+*.csv
+*.jsonl
+*.zip
+*.tar
+*.tar.gz
+*.tgz
